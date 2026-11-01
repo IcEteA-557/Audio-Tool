@@ -41,6 +41,8 @@ pub struct Model {
     pub auto_note: String,
     pub playback_devices: Vec<String>,
     pub selected_playback: usize,
+    /// 为真时播放 Windows 当前的默认输出，而不是记住的某一块声卡。
+    pub follow_default: bool,
     pub playback_note: String,
     pub connected: bool,
     pub connected_addr: Option<Ipv4Addr>,
@@ -142,6 +144,7 @@ impl Model {
             playback_devices: self.playback_devices.clone(),
             selected_playback: self.selected_playback,
             playback_note: self.playback_note.clone(),
+            follow_default: self.follow_default,
             connected: self.connected,
         }
     }
@@ -158,4 +161,5 @@ pub enum Command {
     SetLocalMonitor(bool),
     SetPlaybackDevice(usize),
     Shutdown,
+    UseSystemPlayback,
 }

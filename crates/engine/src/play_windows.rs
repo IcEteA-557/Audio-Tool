@@ -5,12 +5,24 @@ use std::time::Duration;
 
 use wasapi::{
     Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat, initialize_mta,
+    initialize_sta,
 };
 
 use crate::playback::PlaybackEngine;
 
+fn ensure_com() {
+    // 窗口在主线程上创建。winit 会调用 OleInitialize，线程必须留在单线程套间。
+    // 若这里先把主线程初始化成多线程套间，窗口会直接创建失败。
+    // 播放在单独的线程里，那边继续用多线程套间。
+    if std::thread::current().name() == Some("main") {
+        let _ = initialize_sta();
+    } else {
+        let _ = initialize_mta();
+    }
+}
+
 fn enumerator() -> Result<DeviceEnumerator, String> {
-    let _ = initialize_mta();
+    ensure_com();
     DeviceEnumerator::new().map_err(|err| err.to_string())
 }
 

@@ -12,6 +12,9 @@ pub struct Config {
     pub volume: f32,
     pub mute_local: bool,
     pub playback_device: Option<String>,
+    /// 为真时固定使用 playback_device。旧配置没有这个字段，按跟随系统默认处理。
+    #[serde(default)]
+    pub playback_pinned: bool,
 }
 
 impl Default for Config {
@@ -22,6 +25,7 @@ impl Default for Config {
             volume: 1.0,
             mute_local: false,
             playback_device: None,
+            playback_pinned: false,
         }
     }
 }
@@ -35,16 +39,21 @@ impl Config {
     }
 
     pub fn save_from(model: &Model) {
-        let playback_device = model
-            .playback_devices
-            .get(model.selected_playback)
-            .cloned();
+        let playback_device = if model.follow_default {
+            None
+        } else {
+            model
+                .playback_devices
+                .get(model.selected_playback)
+                .cloned()
+        };
         let config = Self {
             prefer_wired: model.prefer_wired,
             target_latency_ms: model.target_latency_ms,
             volume: model.volume,
             mute_local: model.mute_local,
             playback_device,
+            playback_pinned: !model.follow_default,
         };
         if let Some(dir) = path().parent() {
             let _ = fs::create_dir_all(dir);
@@ -53,11 +62,6 @@ impl Config {
             let _ = fs::write(path(), text);
         }
     }
-}
-
-#[cfg(target_os = "windows")]
-pub fn saved_playback_device() -> Option<String> {
-    Config::load().playback_device
 }
 
 fn path() -> PathBuf {

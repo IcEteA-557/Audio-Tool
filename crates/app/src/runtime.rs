@@ -23,10 +23,8 @@ use audiolink_protocol::{
 #[cfg(target_os = "macos")]
 use audiolink_engine::{LocalMonitor, Packetizer, SystemCapture};
 #[cfg(target_os = "windows")]
-use audiolink_engine::{list_render_devices, WasapiPlayback};
+use audiolink_engine::{default_render_device, list_render_devices, WasapiPlayback};
 
-#[cfg(target_os = "windows")]
-use crate::config::saved_playback_device;
 use crate::config::{normalize_latency, Config};
 use crate::model::{Command, Model, Peer};
 
@@ -41,7 +39,8 @@ impl AppRuntime {
     pub fn start() -> Self {
         let config = Config::load();
         let role = local_role();
-        let (playback_devices, selected_playback, playback_note) = load_playback_devices();
+        let (playback_devices, selected_playback, follow_default, playback_note) =
+            load_playback_devices();
         let model = Arc::new(Mutex::new(Model {
             local_name: computer_name(),
             role,
@@ -62,6 +61,7 @@ impl AppRuntime {
             auto_note: String::new(),
             playback_devices,
             selected_playback,
+            follow_default,
             playback_note,
             connected: false,
             connected_addr: None,
@@ -118,29 +118,33 @@ fn local_role() -> Role {
     }
 }
 
-fn load_playback_devices() -> (Vec<String>, usize, String) {
+fn load_playback_devices() -> (Vec<String>, usize, bool, String) {
     #[cfg(target_os = "windows")]
     {
         match list_render_devices() {
             Ok(devices) => {
-                let mut selected = 0;
-                let mut note = String::new();
-                let saved = saved_playback_device();
-                if let Some(saved) = saved.as_ref() {
-                    if let Some(index) = devices.iter().position(|name| name == saved) {
-                        selected = index;
-                    } else if !devices.is_empty() {
-                        note = format!("上次的播放设备“{saved}”不在了，已改用默认设备");
+                let default_index = default_render_device()
+                    .as_ref()
+                    .and_then(|name| devices.iter().position(|item| item == name))
+                    .unwrap_or(0);
+                let config = Config::load();
+                if config.playback_pinned {
+                    if let Some(saved) = config.playback_device {
+                        if let Some(index) = devices.iter().position(|name| name == &saved) {
+                            return (devices, index, false, String::new());
+                        }
+                        let note = format!("上次的播放设备“{saved}”不在了，已改用默认设备");
+                        return (devices, default_index, true, note);
                     }
                 }
-                (devices, selected, note)
+                (devices, default_index, true, String::new())
             }
-            Err(err) => (Vec::new(), 0, err),
+            Err(err) => (Vec::new(), 0, true, err),
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        (Vec::new(), 0, String::new())
+        (Vec::new(), 0, true, String::new())
     }
 }
 
@@ -198,7 +202,8 @@ fn refresh_nics(model: &Mutex<Model>) {
     let bind = transport_ip(&nics, prefer);
     for nic in &mut nics {
         nic.active = if bind.is_unspecified() {
-            nic.ipv4.is_some() && nic.kind != NicKind::Other
+            nic.ipv4
+                .is_some_and(|ip| nic.kind != NicKind::Other && announces_on(ip, nic.kind))
         } else {
             nic.ipv4 == Some(bind)
         };
@@ -225,7 +230,7 @@ fn send_our_beacon(model: &Mutex<Model>) {
         let Some(ip) = nic.ipv4 else {
             continue;
         };
-        if nic.kind == NicKind::Other {
+        if nic.kind == NicKind::Other || !announces_on(ip, nic.kind) {
             continue;
         }
         if !bind.is_unspecified() && ip != bind {
@@ -235,6 +240,12 @@ fn send_our_beacon(model: &Mutex<Model>) {
             log::debug!("从 {ip} 发送信标失败: {err}");
         }
     }
+}
+
+/// 169.254 自动地址在没接线的虚拟网卡上无法广播。有线直连仍保留，两台电脑可能靠它互通。
+fn announces_on(ip: Ipv4Addr, kind: NicKind) -> bool {
+    let link_local = matches!(ip.octets(), [169, 254, _, _]);
+    !link_local || kind == NicKind::DirectCable
 }
 
 fn ingest_beacon(model: &Mutex<Model>, beacon: Beacon, source: Ipv4Addr) {
@@ -301,6 +312,7 @@ fn supervisor_loop(model: Arc<Mutex<Model>>, cmd_rx: Receiver<Command>, stop: Ar
         supervisor.ensure_listener();
         supervisor.accept_one();
         supervisor.start_requested_connection();
+        supervisor.refresh_playback_list();
         supervisor.sync_audio();
         supervisor.poll_session();
         supervisor.publish_status();
@@ -326,6 +338,10 @@ struct Supervisor {
     playback_note: Arc<Mutex<String>>,
     #[cfg(target_os = "windows")]
     playback_key: String,
+    #[cfg(target_os = "windows")]
+    last_default_check: Instant,
+    #[cfg(target_os = "windows")]
+    last_device_list: Instant,
 }
 
 impl Supervisor {
@@ -348,6 +364,10 @@ impl Supervisor {
             playback_note: Arc::new(Mutex::new(String::new())),
             #[cfg(target_os = "windows")]
             playback_key: String::new(),
+            #[cfg(target_os = "windows")]
+            last_default_check: Instant::now() - Duration::from_secs(5),
+            #[cfg(target_os = "windows")]
+            last_device_list: Instant::now() - Duration::from_secs(5),
         }
     }
 
@@ -393,11 +413,24 @@ impl Supervisor {
                 lock(&self.model).local_monitor = enabled;
             }
             Command::SetPlaybackDevice(index) => {
-                lock(&self.model).selected_playback = index;
+                {
+                    let mut model = lock(&self.model);
+                    model.follow_default = false;
+                    model.selected_playback = index;
+                }
                 Config::save_from(&lock(&self.model));
                 #[cfg(target_os = "windows")]
                 {
                     self.playback_key.clear();
+                }
+            }
+            Command::UseSystemPlayback => {
+                lock(&self.model).follow_default = true;
+                Config::save_from(&lock(&self.model));
+                #[cfg(target_os = "windows")]
+                {
+                    self.playback_key.clear();
+                    self.last_default_check = Instant::now() - Duration::from_secs(5);
                 }
             }
             Command::Shutdown => self.stop.store(true, Ordering::Relaxed),
@@ -549,6 +582,32 @@ impl Supervisor {
         }
     }
 
+    fn refresh_playback_list(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if self.last_device_list.elapsed() < Duration::from_secs(2) {
+                return;
+            }
+            self.last_device_list = Instant::now();
+            let Ok(devices) = list_render_devices() else {
+                return;
+            };
+            let mut model = lock(&self.model);
+            if !model.follow_default {
+                let current = model
+                    .playback_devices
+                    .get(model.selected_playback)
+                    .cloned();
+                if let Some(name) = current {
+                    if let Some(index) = devices.iter().position(|item| item == &name) {
+                        model.selected_playback = index;
+                    }
+                }
+            }
+            model.playback_devices = devices;
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn sync_windows_audio(&mut self) {
         let streaming = self.session.as_ref().is_some_and(|session| session.is_streaming());
@@ -558,15 +617,38 @@ impl Supervisor {
             self.playback_key.clear();
             return;
         }
-        let (target, device_name) = {
+        let (target, follow) = {
             let model = lock(&self.model);
-            let device_name = model
-                .playback_devices
-                .get(model.selected_playback)
-                .cloned();
-            (model.target_latency_ms, device_name)
+            (model.target_latency_ms, model.follow_default)
         };
-        let key = device_name.clone().unwrap_or_default();
+        let (device_name, key) = if follow {
+            if self.playback.is_some()
+                && self.last_default_check.elapsed() < Duration::from_millis(500)
+            {
+                (None, self.playback_key.clone())
+            } else {
+                self.last_default_check = Instant::now();
+                let name = default_render_device().unwrap_or_default();
+                {
+                    let mut model = lock(&self.model);
+                    if let Some(index) = model.playback_devices.iter().position(|item| item == &name)
+                    {
+                        model.selected_playback = index;
+                    }
+                }
+                (None, format!("default:{name}"))
+            }
+        } else {
+            let name = {
+                let model = lock(&self.model);
+                model
+                    .playback_devices
+                    .get(model.selected_playback)
+                    .cloned()
+            };
+            let key = name.clone().unwrap_or_default();
+            (name, key)
+        };
         if self.playback.is_some() && self.playback_key == key {
             if let Ok(note) = self.playback_note.lock() {
                 lock(&self.model).playback_note = note.clone();
@@ -864,8 +946,14 @@ impl LiveSession {
     }
 
     fn accepted(peer: Ipv4Addr, stream: TcpStream, model: &Mutex<Model>) -> Result<Self, String> {
-        let role = lock(model).role;
-        let bind_ip = transport_ip(&lock(model).interfaces, lock(model).prefer_wired);
+        // 必须只锁一次。同一条语句里再锁会把这把不可重入的锁永久占住，界面线程跟着卡死。
+        let (role, bind_ip) = {
+            let model = lock(model);
+            (
+                model.role,
+                transport_ip(&model.interfaces, model.prefer_wired),
+            )
+        };
         stream.set_nodelay(true).ok();
         stream.set_nonblocking(true).map_err(|err| err.to_string())?;
         Self::new(peer, stream, false, role, bind_ip)

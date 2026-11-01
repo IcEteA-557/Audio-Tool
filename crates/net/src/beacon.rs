@@ -37,12 +37,25 @@ impl BeaconSocket {
 pub fn send_beacon(ip: Ipv4Addr, mask: Option<Ipv4Addr>, payload: &[u8]) -> io::Result<()> {
     let socket = UdpSocket::bind(SocketAddrV4::new(ip, 0))?;
     socket.set_broadcast(true)?;
-    socket.send_to(payload, SocketAddrV4::new(Ipv4Addr::BROADCAST, BEACON_PORT))?;
+    let mut delivered = false;
+    let mut last_err = None;
+    // 有些网卡拒绝 255.255.255.255。失败后仍要试子网广播，否则信标发不出去。
+    match socket.send_to(payload, SocketAddrV4::new(Ipv4Addr::BROADCAST, BEACON_PORT)) {
+        Ok(_) => delivered = true,
+        Err(err) => last_err = Some(err),
+    }
     if let Some(mask) = mask {
         let dest = broadcast_v4(ip, mask);
         if dest != Ipv4Addr::BROADCAST && dest != ip {
-            let _ = socket.send_to(payload, SocketAddrV4::new(dest, BEACON_PORT));
+            match socket.send_to(payload, SocketAddrV4::new(dest, BEACON_PORT)) {
+                Ok(_) => delivered = true,
+                Err(err) => last_err = Some(err),
+            }
         }
     }
-    Ok(())
+    if delivered {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| io::Error::other("没有发出信标")))
+    }
 }

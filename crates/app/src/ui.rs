@@ -167,25 +167,37 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &Snapshot, selected: &mut Option<usize>
             ui.label(format!("对端播放设备  {name}"));
         }
     } else {
-        let current = snapshot
+        let device_name = snapshot
             .playback_devices
             .get(snapshot.selected_playback)
             .cloned()
             .unwrap_or_else(|| "默认设备".into());
+        let current = if snapshot.follow_default {
+            format!("系统默认 · {device_name}")
+        } else {
+            device_name
+        };
         let mut chosen = None;
+        let mut use_default = false;
         egui::ComboBox::from_label("播放设备")
             .selected_text(current)
             .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(snapshot.follow_default, "系统默认")
+                    .clicked()
+                {
+                    use_default = true;
+                }
                 for (index, name) in snapshot.playback_devices.iter().enumerate() {
-                    if ui
-                        .selectable_label(index == snapshot.selected_playback, name)
-                        .clicked()
-                    {
+                    let picked = !snapshot.follow_default && index == snapshot.selected_playback;
+                    if ui.selectable_label(picked, name).clicked() {
                         chosen = Some(index);
                     }
                 }
             });
-        if let Some(index) = chosen {
+        if use_default {
+            runtime.send(Command::UseSystemPlayback);
+        } else if let Some(index) = chosen {
             runtime.send(Command::SetPlaybackDevice(index));
         }
         if !snapshot.playback_note.is_empty() {
